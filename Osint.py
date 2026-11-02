@@ -2,17 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║   RED PHANTOM OSINT — BOT INTEGRATION EDITION                        ║
-║   Manual Input · Full Read · Bot Notif · Real-Time Monitor          ║
-║   Powered by Yusiqo · Untuk penggunaan yang SAH & BERIZIN saja      ║
+║   RED PHANTOM OSINT — FINAL STABLE EDITION                           ║
+║   Manual Input · Full Read · Bot Notif · Real-Time · Fast Mode       ║
+║   Powered by Yusiqo · Untuk penggunaan yang SAH & BERIZIN saja       ║
 ╚══════════════════════════════════════════════════════════════════════╝
-
-  FITUR BARU (vs versi sebelumnya):
-    ✅ Kirim hasil scrape ke BOT Telegram Anda (real-time)
-    ✅ Terima notifikasi perubahan profil via bot
-    ✅ Kirim file JSON/CSV/HTML otomatis ke chat Anda
-    ✅ Bot commands: /start, /scan, /monitor, /status, /help
-    ✅ Hanya admin ID yang bisa kontrol bot
 """
 
 import os
@@ -20,8 +13,8 @@ import sys
 import re
 import json
 import csv
-import io
 import asyncio
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import Counter
@@ -31,7 +24,7 @@ from pyrogram.errors import (
     PeerIdInvalid, UsernameInvalid, UsernameNotOccupied,
     FloodWait, ChatAdminRequired, UserNotParticipant,
     ChannelPrivate, ChatForbidden, AuthKeyUnregistered,
-    MessageTooLong, BotMethodInvalid,
+    MessageTooLong, MessageNotModified, UserAlreadyParticipant,
 )
 from pyrogram.types import User, Message
 from pyfiglet import figlet_format
@@ -39,24 +32,18 @@ from termcolor import colored
 
 
 # ══════════════════════════════════════════════════════════════════
-# ⚙  KONFIGURASI BOT & OPERATOR — EDIT DI SINI
+# ⚙  KONFIGURASI — EDIT DI SINI SAJA
 # ══════════════════════════════════════════════════════════════════
 BOT_CONFIG = {
-    # Token bot dari @BotFather (WAJIB)
     "bot_token": "8831458505:AAFv8SB4O6eAwSdISxfEQ9YXZwrR34ZN3C4",
-
-    # ID Telegram Anda (WAJIB) — dari @userinfobot
-    # Bisa lebih dari 1 ID (list) untuk multiple admin
     "admin_ids": [8466466096],
-
-    # Kirim notifikasi real-time ke bot saat monitor?
     "notify_realtime": True,
-
-    # Kirim file JSON/CSV/HTML ke chat bot?
     "send_files": True,
-
-    # Auto-start bot di background saat script jalan?
-    "start_bot": True,
+    "fast_mode": True,              # True = scan cepat (limit lebih kecil)
+    "scan_timeout_sec": 300,        # max 5 menit per scan
+    "default_msg_limit": 100,
+    "default_max_scan": 3000,       # turun dari 5000 → lebih cepat
+    "default_max_mb": 20,
 }
 
 
@@ -71,10 +58,12 @@ BOT_STATE     = Path("bot_state.json")
 
 RED           = "red"
 BRIGHT_RED    = "light_red"
+GREEN         = "green"
+YELLOW        = "yellow"
 
 
 # ══════════════════════════════════════════════════════════════════
-# UI
+# UI HELPERS
 # ══════════════════════════════════════════════════════════════════
 def cprint(text, color=BRIGHT_RED, attrs=None):
     try:
@@ -89,22 +78,26 @@ def banner():
     cprint(art, RED, attrs=["bold"])
     line = "═" * 64
     cprint(f"  {line}", RED)
-    cprint("   ⚡  TELEGRAM OSINT · MANUAL · FULL READ · BOT  ⚡", RED, attrs=["bold"])
+    cprint("   ⚡  TELEGRAM OSINT · FINAL STABLE · FAST MODE  ⚡", RED, attrs=["bold"])
     cprint(f"  {line}", RED)
-    cprint("   ▸ Tool    : Red Phantom — Bot Integration", BRIGHT_RED)
+    cprint("   ▸ Tool    : Red Phantom — Final Stable", BRIGHT_RED)
     cprint("   ▸ Author  : Yusiqo", BRIGHT_RED)
-    cprint("   ▸ Mode    : Manual input + Full Read + Bot notif", BRIGHT_RED)
+    cprint("   ▸ Mode    : Manual · Full Read · Bot · Fast", BRIGHT_RED)
     cprint(f"  {line}\n", RED)
 
 
-def section(title, icon="◆"):
+def section(title, icon="◆", quiet=False):
+    if quiet:
+        return
     line = "─" * 62
     cprint(f"\n┌{line}┐", RED)
     cprint(f"│ {icon} {title.upper():<59}│", RED, attrs=["bold"])
     cprint(f"└{line}┘", RED)
 
 
-def kv(label, value, value_color="white"):
+def kv(label, value, value_color="white", quiet=False):
+    if quiet:
+        return
     left  = colored(f"    ▹ {label:<18}: ", BRIGHT_RED, attrs=["bold"])
     right = colored(str(value), value_color)
     print(f"{left}{right}")
@@ -114,13 +107,15 @@ def status(tag, message, color=BRIGHT_RED):
     print(colored(f"  [{tag}] ", color, attrs=["bold"]) + colored(message, "white"))
 
 
-def success(msg):  status("✔", msg, "green")
-def warn(msg):     status("!", msg, "yellow")
+def success(msg):  status("✔", msg, GREEN)
+def warn(msg):     status("!", msg, YELLOW)
 def error(msg):    status("✘", msg, RED)
 def info(msg):     status("›", msg, BRIGHT_RED)
 
 
-def progress_bar(i, total, prefix="", length=30):
+def progress_bar(i, total, prefix="", length=30, quiet=False):
+    if quiet:
+        return
     filled = int(length * i // total) if total else length
     bar = "█" * filled + "░" * (length - filled)
     print(colored(f"\r  {prefix} |{bar}| {i}/{total}", RED), end="", flush=True)
@@ -144,9 +139,7 @@ def ask(prompt, default=None, allow_empty=False):
 
 def ask_yes_no(prompt, default="n"):
     raw = input(colored(f"  ▸ {prompt} (y/n) [{default}]: ", BRIGHT_RED)).strip().lower()
-    if not raw:
-        raw = default
-    return raw in ("y", "yes", "1", "true")
+    return (raw or default) in ("y", "yes", "1", "true")
 
 
 def ask_int(prompt, default=None, min_val=0):
@@ -158,7 +151,7 @@ def ask_int(prompt, default=None, min_val=0):
         try:
             v = int(raw)
             if v < min_val:
-                warn(f"Nilai minimal {min_val}")
+                warn(f"Minimal {min_val}")
                 continue
             return v
         except ValueError:
@@ -166,67 +159,108 @@ def ask_int(prompt, default=None, min_val=0):
 
 
 # ══════════════════════════════════════════════════════════════════
-# 🆕 BOT NOTIFIER — kirim hasil ke bot
+# MARKDOWN ESCAPE (fix bug: bio dengan _ * [ ] error)
+# ══════════════════════════════════════════════════════════════════
+def md_escape(s) -> str:
+    if s is None:
+        return "None"
+    s = str(s)
+    for ch in ["_", "*", "[", "]", "`", "(", ")", "~", ">", "#", "+", "-", "=", "|", "{", "}"]:
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
+def md_safe(s, max_len=200) -> str:
+    s = md_escape(s)
+    if len(s) > max_len:
+        s = s[:max_len] + "…"
+    return s
+
+
+# ══════════════════════════════════════════════════════════════════
+# BOT NOTIFIER (FIXED — split & escape markdown)
 # ══════════════════════════════════════════════════════════════════
 class BotNotifier:
-    """Wrapper untuk kirim notifikasi via bot Telegram ke admin."""
     def __init__(self, bot_client: Client, admin_ids: list):
         self.bot = bot_client
         self.admin_ids = admin_ids
 
     async def send_text(self, text: str, markdown=True):
-        """Kirim teks ke semua admin."""
+        if not text:
+            return
+        # Split ke 3500 char (aman dari 4096)
+        chunks = []
+        cur = ""
+        for line in text.split("\n"):
+            if len(cur) + len(line) + 1 > 3500:
+                chunks.append(cur)
+                cur = line
+            else:
+                cur += ("\n" if cur else "") + line
+        if cur:
+            chunks.append(cur)
+
         for aid in self.admin_ids:
-            try:
-                # Split kalau kepanjangan
-                chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
-                for chunk in chunks:
+            for chunk in chunks:
+                try:
+                    await self.bot.send_message(
+                        aid, chunk,
+                        parse_mode="markdown" if markdown else None,
+                        disable_web_page_preview=True,
+                    )
+                except (MessageTooLong, MessageNotModified):
                     try:
-                        await self.bot.send_message(
-                            aid, chunk,
-                            parse_mode="markdown" if markdown else None,
-                            disable_web_page_preview=True,
-                        )
-                    except MessageTooLong:
                         await self.bot.send_message(aid, chunk[:4000])
-            except FloodWait as fw:
-                await asyncio.sleep(fw.value)
-            except Exception as e:
-                warn(f"Bot send error: {e}")
+                    except Exception:
+                        pass
+                except FloodWait as fw:
+                    await asyncio.sleep(fw.value + 1)
+                    try:
+                        await self.bot.send_message(aid, chunk)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    # Fallback plain text
+                    try:
+                        plain = re.sub(r"[*_`\[\]]", "", chunk)
+                        await self.bot.send_message(aid, plain)
+                    except Exception:
+                        warn(f"Bot send error: {type(e).__name__}")
 
     async def send_file(self, filepath: str, caption=""):
-        """Kirim file ke semua admin."""
+        if not filepath or not Path(filepath).exists():
+            return
         for aid in self.admin_ids:
             try:
                 await self.bot.send_document(aid, filepath, caption=caption)
             except FloodWait as fw:
-                await asyncio.sleep(fw.value)
+                await asyncio.sleep(fw.value + 1)
+                try:
+                    await self.bot.send_document(aid, filepath, caption=caption)
+                except Exception:
+                    pass
             except Exception as e:
                 warn(f"Bot file error: {e}")
 
     async def send_profile_summary(self, user_data: dict, geo: dict, summary: dict):
-        """Kirim ringkasan profil dalam format cantik."""
         u = user_data
         md = f"""🩸 **RED PHANTOM — SCAN RESULT**
 
 👤 **Target**
-• Username: `@{u.get('username') or 'None'}`
-• Name: **{u.get('first_name') or ''} {u.get('last_name') or ''}**
+• Username: `@{md_safe(u.get('username') or 'None', 40)}`
+• Name: **{md_safe(u.get('first_name') or '', 50)} {md_safe(u.get('last_name') or '', 50)}**
 • ID: `{u.get('id')}`
-• Phone: `{u.get('phone') or 'Hidden'}`
+• Phone: `{md_safe(u.get('phone') or 'Hidden', 20)}`
 • DC: `{u.get('dc_id')}`
-• Status: `{u.get('status') or 'None'}`
-• Language: `{u.get('language') or 'None'}`
+• Status: `{md_safe(u.get('status') or 'None', 40)}`
+• Language: `{md_safe(u.get('language') or 'None', 10)}`
 
 📝 **Bio**
-`{u.get('bio') or 'None'}`
+`{md_safe(u.get('bio') or 'None', 200)}`
 
 🏷 **Flags**
-• Bot: `{u.get('is_bot')}`
-• Verified: `{u.get('is_verified')}`
-• Premium: `{u.get('is_premium')}`
-• Scam: `{u.get('is_scam')}`
-• Fake: `{u.get('is_fake')}`
+• Bot: `{u.get('is_bot')}` · Verified: `{u.get('is_verified')}`
+• Premium: `{u.get('is_premium')}` · Scam: `{u.get('is_scam')}` · Fake: `{u.get('is_fake')}`
 
 🌍 **Geo (dari bio)**
 • Country: `{geo.get('country') or '-'}`
@@ -242,157 +276,25 @@ class BotNotifier:
         await self.send_text(md)
 
     async def send_change_alert(self, user: User, changes: list):
-        """Kirim notif real-time perubahan profil."""
         md = f"🚨 **PROFILE CHANGE DETECTED**\n\n"
-        md += f"👤 `@{user.username or 'None'}` ({user.id})\n\n"
+        md += f"👤 `@{md_safe(user.username or 'None', 40)}` ({user.id})\n\n"
         for ch in changes:
             md += f"▸ **{ch['field']}**\n"
-            md += f"   Old: `{str(ch['old'])[:80]}`\n"
-            md += f"   New: `{str(ch['new'])[:80]}`\n\n"
+            md += f"   Old: `{md_safe(ch['old'], 80)}`\n"
+            md += f"   New: `{md_safe(ch['new'], 80)}`\n\n"
         md += f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
         await self.send_text(md)
 
     async def send_new_message(self, user: User, msg: dict):
-        """Kirim notif pesan baru masuk dari target."""
-        md = f"💬 **NEW MESSAGE from** `@{user.username or user.id}`\n\n"
+        md = f"💬 **NEW MESSAGE from** `@{md_safe(user.username or user.id, 40)}`\n\n"
         md += f"🕐 `{msg['date']}`\n"
-        md += f"📝 {msg['text'][:500]}"
+        md += f"📝 {md_safe(msg['text'][:500], 500)}"
         await self.send_text(md)
 
 
 # ══════════════════════════════════════════════════════════════════
-# 🆕 BOT COMMAND HANDLERS
+# BOT STATE
 # ══════════════════════════════════════════════════════════════════
-def register_bot_handlers(bot: Client, userbot: Client, notifier: BotNotifier):
-    """Daftarkan command handler untuk bot."""
-
-    def is_admin(_, __, message: Message):
-        return message.from_user and message.from_user.id in BOT_CONFIG["admin_ids"]
-
-    admin_filter = filters.create(is_admin)
-
-    @bot.on_message(filters.command("start") & admin_filter)
-    async def cmd_start(_, message: Message):
-        text = """🩸 **RED PHANTOM BOT**
-
-Selamat datang, admin!
-
-**Commands:**
-• `/scan @username` — scan target (default limit 100)
-• `/scan @username 50` — scan dengan limit pesan 50
-• `/quick @username` — quick scan (profil + geo saja)
-• `/monitor @username` — monitor real-time perubahan
-• `/stopmonitor` — stop semua monitor
-• `/status` — status bot & sistem
-• `/help` — bantuan
-
-**Hasil scan akan dikirim otomatis:**
-✅ Summary di chat
-✅ File JSON (data lengkap)
-✅ File CSV (pesan → Excel)
-✅ File HTML (report visual)
-"""
-        await message.reply(text)
-
-    @bot.on_message(filters.command("help") & admin_filter)
-    async def cmd_help(_, message: Message):
-        await cmd_start(_, message)
-
-    @bot.on_message(filters.command("status") & admin_filter)
-    async def cmd_status(_, message: Message):
-        me_user = await userbot.get_me()
-        me_bot = await bot.get_me()
-        text = f"""📊 **STATUS**
-
-🤖 Bot: `@{me_bot.username}`
-👤 Userbot: `@{me_user.username or me_user.id}`
-🕐 Time: `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}`
-📁 Reports: `{REPORT_DIR.absolute()}`
-🎯 Admins: `{len(BOT_CONFIG['admin_ids'])}`
-"""
-        await message.reply(text)
-
-    @bot.on_message(filters.command("scan") & admin_filter)
-    async def cmd_scan(_, message: Message):
-        args = message.text.split()
-        if len(args) < 2:
-            await message.reply("❌ Usage: `/scan @username [limit]`")
-            return
-
-        target = args[1]
-        limit = int(args[2]) if len(args) > 2 and args[2].isdigit() else 100
-
-        await message.reply(f"🔍 Scanning `{target}` (limit {limit})...\n⏳ Mohon tunggu...")
-
-        try:
-            user = await userbot.get_users(target)
-        except Exception as e:
-            await message.reply(f"❌ Target tidak ditemukan: `{e}`")
-            return
-
-        # Jalankan scrape
-        payload = await scan_and_export(userbot, user, limit, notifier=notifier)
-        if payload:
-            await message.reply(f"✅ Scan selesai untuk `@{user.username or user.id}`")
-
-    @bot.on_message(filters.command("quick") & admin_filter)
-    async def cmd_quick(_, message: Message):
-        args = message.text.split()
-        if len(args) < 2:
-            await message.reply("❌ Usage: `/quick @username`")
-            return
-        target = args[1]
-        await message.reply(f"⚡ Quick scan `{target}`...")
-        try:
-            user = await userbot.get_users(target)
-        except Exception as e:
-            await message.reply(f"❌ Error: `{e}`")
-            return
-
-        # Quick = profil + geo + photos only
-        user_data = await read_profile(userbot, user)
-        geo = geo_from_bio(user_data.get("bio") or "")
-        summary = {"total_groups": 0, "total_msgs": 0, "private_msgs": 0,
-                   "photos": 0}
-        await notifier.send_profile_summary(user_data, geo, summary)
-        await message.reply("✅ Quick scan selesai.")
-
-    @bot.on_message(filters.command("monitor") & admin_filter)
-    async def cmd_monitor(_, message: Message):
-        args = message.text.split()
-        if len(args) < 2:
-            await message.reply("❌ Usage: `/monitor @username`")
-            return
-        target = args[1]
-        await message.reply(f"🔴 Monitor `{target}` dimulai...\n"
-                            f"Notif dikirim saat ada perubahan.\n"
-                            f"Stop dengan `/stopmonitor`")
-        try:
-            user = await userbot.get_users(target)
-        except Exception as e:
-            await message.reply(f"❌ Error: `{e}`")
-            return
-        # Simpan ke state
-        state = load_bot_state()
-        state.setdefault("monitors", {})[str(user.id)] = {
-            "username": user.username,
-            "started":  datetime.now(timezone.utc).isoformat(),
-        }
-        save_bot_state(state)
-
-        # Jalankan monitor background
-        asyncio.create_task(monitor_with_bot(userbot, user, notifier, interval=60))
-
-    @bot.on_message(filters.command("stopmonitor") & admin_filter)
-    async def cmd_stopmonitor(_, message: Message):
-        state = load_bot_state()
-        state["monitors"] = {}
-        save_bot_state(state)
-        await message.reply("⏹ Semua monitor dihentikan.")
-
-    success("Bot handlers terdaftar.")
-
-
 def load_bot_state() -> dict:
     if BOT_STATE.exists():
         try:
@@ -403,16 +305,18 @@ def load_bot_state() -> dict:
 
 
 def save_bot_state(state: dict):
-    with open(BOT_STATE, "w") as f:
-        json.dump(state, f, indent=2, default=str)
+    try:
+        with open(BOT_STATE, "w") as f:
+            json.dump(state, f, indent=2, default=str)
+    except Exception as e:
+        warn(f"Save state error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════
-# 🆕 MONITOR WITH BOT NOTIF
+# MONITOR WITH BOT (FIXED — anti-hang, error counter)
 # ══════════════════════════════════════════════════════════════════
 async def monitor_with_bot(client: Client, user: User,
                            notifier: BotNotifier, interval=60):
-    """Monitor real-time dengan notif bot."""
     info(f"Monitor start: @{user.username or user.id} (interval {interval}s)")
     prev = snap_user(user)
     last_mid = 0
@@ -423,20 +327,28 @@ async def monitor_with_bot(client: Client, user: User,
     except Exception:
         pass
 
+    error_count = 0
     while True:
-        # Cek apakah masih ada di monitors list
         state = load_bot_state()
         if str(user.id) not in state.get("monitors", {}):
             info(f"Monitor stop: @{user.username or user.id}")
             return
 
+        if error_count >= 10:
+            warn("Monitor auto-stop: terlalu banyak error.")
+            state["monitors"].pop(str(user.id), None)
+            save_bot_state(state)
+            return
+
         try:
             fresh = await client.get_users(user.id)
+            error_count = 0
         except FloodWait as fw:
-            await asyncio.sleep(fw.value)
+            await asyncio.sleep(fw.value + 1)
             continue
         except Exception as e:
-            warn(f"Monitor refresh error: {e}")
+            error_count += 1
+            warn(f"Monitor refresh error #{error_count}: {type(e).__name__}")
             await asyncio.sleep(interval)
             continue
 
@@ -447,10 +359,15 @@ async def monitor_with_bot(client: Client, user: User,
             info(f"⚠ {len(diffs)} perubahan pada @{fresh.username or fresh.id}")
             changes_list = [{"field": k, "old": o, "new": n} for k, o, n in diffs]
             if BOT_CONFIG.get("notify_realtime", True):
-                await notifier.send_change_alert(fresh, changes_list)
-            track_username(fresh)
+                try:
+                    await notifier.send_change_alert(fresh, changes_list)
+                except Exception as e:
+                    warn(f"Notif error: {e}")
+            try:
+                track_username(fresh, quiet=True)
+            except Exception:
+                pass
 
-        # Cek pesan baru
         new_msgs = []
         try:
             async for m in client.get_chat_history(user.id, limit=20):
@@ -466,45 +383,68 @@ async def monitor_with_bot(client: Client, user: User,
                 last_mid = max(x["id"] for x in new_msgs)
                 for x in reversed(new_msgs):
                     if BOT_CONFIG.get("notify_realtime", True):
-                        await notifier.send_new_message(fresh, x)
+                        try:
+                            await notifier.send_new_message(fresh, x)
+                        except Exception:
+                            pass
         except Exception as e:
-            warn(f"Monitor msg error: {e}")
+            warn(f"Monitor msg error: {type(e).__name__}")
 
         prev = cur
         await asyncio.sleep(interval)
 
 
 # ══════════════════════════════════════════════════════════════════
-# SCAN + EXPORT + SEND TO BOT
+# SCAN + EXPORT (FIXED — parallel + fast + timeout)
 # ══════════════════════════════════════════════════════════════════
 async def scan_and_export(client: Client, user: User, msg_limit: int,
                           notifier: BotNotifier = None,
-                          max_scan: int = 5000,
+                          max_scan: int = 3000,
                           download: bool = False,
-                          max_mb: int = 20) -> dict:
-    """Scan lengkap + export + kirim ke bot."""
-    # Profile
-    user_data = await read_profile(client, user)
-    history = track_username(user)
+                          max_mb: int = 20,
+                          quiet: bool = True) -> dict:
+    """Scan lengkap + export + kirim ke bot. Quiet mode default ON."""
+    try:
+        return await asyncio.wait_for(
+            _scan_inner(client, user, msg_limit, notifier, max_scan,
+                        download, max_mb, quiet),
+            timeout=BOT_CONFIG.get("scan_timeout_sec", 300),
+        )
+    except asyncio.TimeoutError:
+        error("Scan timeout — hasil partial mungkin sudah ada.")
+        if notifier:
+            await notifier.send_text("⏰ Scan timeout (5 menit). Hasil partial mungkin sudah dikirim.")
+        return {}
+
+
+async def _scan_inner(client, user, msg_limit, notifier, max_scan,
+                      download, max_mb, quiet):
+    # 1) Profile
+    user_data = await read_profile(client, user, quiet=quiet)
+    history = track_username(user, quiet=quiet)
     geo = geo_from_bio(user_data.get("bio") or "")
-    show_geo(geo)
+    if not quiet:
+        show_geo(geo)
 
-    # Photos
-    photos = await read_profile_photos(client, user, download=download)
+    # 2) Photos (limit kecil untuk cepat)
+    photos = await read_profile_photos(client, user, limit=10,
+                                       download=download, quiet=quiet)
 
-    # Groups + private
-    groups = await read_common_groups(client, user, msg_limit, max_scan,
-                                      download, max_mb, quiet=True)
-    private_msgs = await read_private_chat(client, user, msg_limit, max_scan,
-                                           download, max_mb, quiet=True)
+    # 3) Groups + private — PARALLEL untuk cepat
+    groups_task = read_common_groups(client, user, msg_limit, max_scan,
+                                     download, max_mb, quiet=True)
+    private_task = read_private_chat(client, user, msg_limit, max_scan,
+                                     download, max_mb, quiet=True)
+    groups, private_msgs = await asyncio.gather(groups_task, private_task,
+                                                 return_exceptions=False)
 
-    # Mentions + activity
-    mentions = await analyze_mentions(client, user, groups)
+    # 4) Mentions + activity
+    mentions = await analyze_mentions(client, user, groups, quiet=quiet)
     all_msgs = []
     for g in groups:
         all_msgs.extend(g["messages"])
     all_msgs.extend(private_msgs)
-    activity = analyze_activity(all_msgs)
+    activity = analyze_activity(all_msgs, quiet=quiet)
 
     summary = {
         "total_groups": len(groups),
@@ -514,7 +454,7 @@ async def scan_and_export(client: Client, user: User, msg_limit: int,
     }
 
     payload = {
-        "meta": {"tool": "Red Phantom", "version": "5.0-bot",
+        "meta": {"tool": "Red Phantom", "version": "6.0-final",
                  "timestamp": datetime.now(timezone.utc).isoformat(),
                  "target": user_data.get("username") or str(user_data["id"])},
         "user": user_data,
@@ -528,18 +468,15 @@ async def scan_and_export(client: Client, user: User, msg_limit: int,
         "summary": summary,
     }
 
-    # Export
-    section("Export", "💾")
+    section("Export", "💾", quiet=quiet)
     tgt = user_data.get("username") or str(user_data["id"])
-    json_path = export_json(payload, tgt)
-    csv_path  = export_csv(payload, tgt)
-    html_path = export_html(payload, tgt)
+    json_path = export_json(payload, tgt, quiet=quiet)
+    csv_path  = export_csv(payload, tgt, quiet=quiet)
+    html_path = export_html(payload, tgt, quiet=quiet)
 
-    # KIRIM KE BOT
     if notifier and BOT_CONFIG.get("send_files", True):
-        section("Send to Bot", "📤")
+        section("Send to Bot", "📤", quiet=quiet)
         await notifier.send_profile_summary(user_data, geo, summary)
-
         for path, caption in [
             (json_path, "📄 Full data (JSON)"),
             (csv_path,  "📊 Messages (CSV)"),
@@ -547,29 +484,177 @@ async def scan_and_export(client: Client, user: User, msg_limit: int,
         ]:
             if path and Path(path).exists():
                 await notifier.send_file(path, caption)
-                success(f"Terkirim: {Path(path).name}")
 
     return payload
+
+
+# ══════════════════════════════════════════════════════════════════
+# BOT HANDLERS (FIXED — admin filter pakai filters.user)
+# ══════════════════════════════════════════════════════════════════
+def register_bot_handlers(bot: Client, userbot: Client, notifier: BotNotifier):
+    admin_filter = filters.user(BOT_CONFIG["admin_ids"])
+
+    @bot.on_message(filters.command("start") & admin_filter)
+    async def cmd_start(_, message: Message):
+        await message.reply("""🩸 **RED PHANTOM BOT** — FINAL STABLE
+
+**Commands:**
+• `/scan @username [limit]` — scan lengkap (background)
+• `/quick @username` — profil + geo saja (cepat)
+• `/monitor @username` — monitor real-time
+• `/stopmonitor` — stop semua monitor
+• `/status` — status bot
+• `/help` — bantuan
+
+**Hasil scan otomatis dikirim:**
+✅ Summary · JSON · CSV · HTML
+""")
+
+    @bot.on_message(filters.command("help") & admin_filter)
+    async def cmd_help(_, message: Message):
+        await cmd_start(_, message)
+
+    @bot.on_message(filters.command("status") & admin_filter)
+    async def cmd_status(_, message: Message):
+        try:
+            me_user = await userbot.get_me()
+            me_bot = await bot.get_me()
+            state = load_bot_state()
+            monitors = len(state.get("monitors", {}))
+            text = f"""📊 **STATUS**
+
+🤖 Bot: `@{me_bot.username}`
+👤 Userbot: `@{me_user.username or me_user.id}`
+🕐 Time: `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}`
+📁 Reports: `{REPORT_DIR.absolute()}`
+🎯 Admins: `{len(BOT_CONFIG['admin_ids'])}`
+🔴 Active monitors: `{monitors}`
+⚡ Fast mode: `{BOT_CONFIG.get('fast_mode', False)}`
+"""
+            await message.reply(text)
+        except Exception as e:
+            await message.reply(f"❌ Error: `{e}`")
+
+    @bot.on_message(filters.command("scan") & admin_filter)
+    async def cmd_scan(_, message: Message):
+        args = message.text.split()
+        if len(args) < 2:
+            await message.reply("❌ Usage: `/scan @username [limit]`")
+            return
+        target = args[1]
+        limit = int(args[2]) if len(args) > 2 and args[2].isdigit() else BOT_CONFIG["default_msg_limit"]
+
+        await message.reply(
+            f"🔍 **Scan started** `{target}` (limit {limit})\n"
+            f"⏳ Hasil akan dikirim otomatis saat selesai.\n"
+            f"Bot tetap responsif selama scan."
+        )
+
+        # ASYNC task — bot tidak block
+        async def _do_scan():
+            try:
+                user = await userbot.get_users(target)
+                await scan_and_export(
+                    userbot, user, limit, notifier=notifier,
+                    max_scan=BOT_CONFIG["default_max_scan"],
+                    download=False,
+                    max_mb=BOT_CONFIG["default_max_mb"],
+                    quiet=True,
+                )
+                await notifier.send_text(f"✅ **Scan selesai** `@{user.username or user.id}`")
+            except PeerIdInvalid:
+                await notifier.send_text(f"❌ Target `{target}` tidak ditemukan.")
+            except Exception as e:
+                await notifier.send_text(f"❌ Scan error: `{md_safe(str(e), 200)}`")
+
+        asyncio.create_task(_do_scan())
+
+    @bot.on_message(filters.command("quick") & admin_filter)
+    async def cmd_quick(_, message: Message):
+        args = message.text.split()
+        if len(args) < 2:
+            await message.reply("❌ Usage: `/quick @username`")
+            return
+        target = args[1]
+        await message.reply(f"⚡ Quick scan `{target}`...")
+        try:
+            user = await userbot.get_users(target)
+        except Exception as e:
+            await message.reply(f"❌ Error: `{md_safe(str(e), 200)}`")
+            return
+        user_data = await read_profile(userbot, user, quiet=True)
+        geo = geo_from_bio(user_data.get("bio") or "")
+        summary = {"total_groups": 0, "total_msgs": 0, "private_msgs": 0, "photos": 0}
+        await notifier.send_profile_summary(user_data, geo, summary)
+        await message.reply("✅ Quick scan selesai.")
+
+    @bot.on_message(filters.command("monitor") & admin_filter)
+    async def cmd_monitor(_, message: Message):
+        args = message.text.split()
+        if len(args) < 2:
+            await message.reply("❌ Usage: `/monitor @username`")
+            return
+        target = args[1]
+        try:
+            user = await userbot.get_users(target)
+        except Exception as e:
+            await message.reply(f"❌ Error: `{md_safe(str(e), 200)}`")
+            return
+
+        state = load_bot_state()
+        if str(user.id) in state.get("monitors", {}):
+            await message.reply(f"⚠ Monitor untuk `@{user.username or user.id}` sudah aktif.")
+            return
+
+        state.setdefault("monitors", {})[str(user.id)] = {
+            "username": user.username,
+            "started":  datetime.now(timezone.utc).isoformat(),
+        }
+        save_bot_state(state)
+
+        asyncio.create_task(monitor_with_bot(userbot, user, notifier, interval=60))
+
+        await message.reply(
+            f"🔴 **Monitor started** `@{user.username or user.id}`\n"
+            f"Interval: 60s · Stop: `/stopmonitor`"
+        )
+
+    @bot.on_message(filters.command("stopmonitor") & admin_filter)
+    async def cmd_stopmonitor(_, message: Message):
+        state = load_bot_state()
+        count = len(state.get("monitors", {}))
+        state["monitors"] = {}
+        save_bot_state(state)
+        await message.reply(f"⏹ {count} monitor dihentikan.")
+
+    # Fallback untuk non-admin
+    @bot.on_message(filters.private & ~admin_filter)
+    async def deny(_, message: Message):
+        await message.reply("🚫 Akses ditolak. Admin only.")
+
+    success("Bot handlers terdaftar.")
 
 
 # ══════════════════════════════════════════════════════════════════
 # KONFIGURASI API
 # ══════════════════════════════════════════════════════════════════
 def load_config() -> dict:
-    if os.path.exists(CONFIG_FILE):
+    if CONFIG_FILE and os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
+            return json.load(open(CONFIG_FILE))
         except Exception:
-            error("config.json rusak, buat baru.")
+            error("config.json rusak.")
     return {}
 
 
 def save_config(api_id, api_hash, session_name):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump({"api_id": api_id, "api_hash": api_hash,
-                   "session_name": session_name}, f, indent=4)
-    success("Konfigurasi tersimpan.")
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump({"api_id": api_id, "api_hash": api_hash,
+                       "session_name": session_name}, f, indent=4)
+        success("Konfigurasi tersimpan.")
+    except Exception as e:
+        error(f"Save config error: {e}")
 
 
 def get_config() -> dict:
@@ -668,7 +753,7 @@ async def resolve_target(client: Client):
         return None
     except FloodWait as fw:
         warn(f"FloodWait {fw.value}s")
-        await asyncio.sleep(fw.value)
+        await asyncio.sleep(fw.value + 1)
         return await resolve_target(client)
     except Exception as e:
         error(f"Error: {e}")
@@ -676,19 +761,10 @@ async def resolve_target(client: Client):
 
 
 # ══════════════════════════════════════════════════════════════════
-# (Bagian read_profile, read_profile_photos, geo, track_username,
-#  read_common_groups, read_private_chat, analyze_mentions,
-#  analyze_activity, read_saved, read_contacts, export_json,
-#  export_csv, export_html, snap_user, media_label, try_download
-#  → SAMA PERSIS dengan kode lama Anda. Tidak diubah sama sekali.)
+# CORE SCRAPE FUNCTIONS (FIXED — semua punya parameter `quiet`)
 # ══════════════════════════════════════════════════════════════════
-
-# ──────────────────────────────────────────────────────────────────
-# SEMUA FUNGSI DI BAWAH INI DI-COPY DARI KODE LAMA ANDA — TIDAK DIUBAH
-# ──────────────────────────────────────────────────────────────────
-
-async def read_profile(client: Client, user: User) -> dict:
-    section("Full Profile Read", "🎯")
+async def read_profile(client: Client, user: User, quiet=False) -> dict:
+    section("Full Profile Read", "🎯", quiet=quiet)
     try:
         user = await client.get_users(user.id)
     except Exception:
@@ -717,38 +793,41 @@ async def read_profile(client: Client, user: User) -> dict:
             "big_file_id":   user.photo.big_file_id,
             "dc_id":         user.photo.dc_id,
         }
-    kv("ID", data["id"], RED)
-    kv("Username", f"@{data['username']}" if data["username"] else "None", RED)
-    kv("First Name", data["first_name"] or "None")
-    kv("Last Name", data["last_name"] or "None")
-    kv("Phone", data["phone"] or "Hidden", "yellow")
-    kv("DC ID", data["dc_id"])
-    kv("Language", data["language"] or "None")
-    kv("Status", data["status"] or "None")
-    kv("Bio", data["bio"] or "None", "cyan")
-    print()
-    kv("Bot", "Yes" if data["is_bot"] else "No")
-    kv("Verified", "Yes" if data["is_verified"] else "No", "cyan")
-    kv("Premium", "Yes" if data["is_premium"] else "No", "cyan")
-    kv("Support", "Yes" if data["is_support"] else "No")
-    kv("Contact", data["is_contact"] if data["is_contact"] is not None else "N/A")
-    kv("Mutual", data["is_mutual_contact"] if data["is_mutual_contact"] is not None else "N/A")
-    kv("Deleted", data["is_deleted"] if data["is_deleted"] is not None else "N/A")
-    kv("Restricted", "Yes" if data["is_restricted"] else "No")
-    kv("Scam", "Yes" if data["is_scam"] else "No", "red" if data["is_scam"] else "white")
-    kv("Fake", "Yes" if data["is_fake"] else "No", "red" if data["is_fake"] else "white")
-    kv("Has Photo", "Yes" if data["photo"] else "No")
+    if not quiet:
+        kv("ID", data["id"], RED)
+        kv("Username", f"@{data['username']}" if data["username"] else "None", RED)
+        kv("First Name", data["first_name"] or "None")
+        kv("Last Name", data["last_name"] or "None")
+        kv("Phone", data["phone"] or "Hidden", YELLOW)
+        kv("DC ID", data["dc_id"])
+        kv("Language", data["language"] or "None")
+        kv("Status", data["status"] or "None")
+        kv("Bio", data["bio"] or "None", "cyan")
+        print()
+        kv("Bot", "Yes" if data["is_bot"] else "No")
+        kv("Verified", "Yes" if data["is_verified"] else "No", "cyan")
+        kv("Premium", "Yes" if data["is_premium"] else "No", "cyan")
+        kv("Support", "Yes" if data["is_support"] else "No")
+        kv("Contact", data["is_contact"] if data["is_contact"] is not None else "N/A")
+        kv("Mutual", data["is_mutual_contact"] if data["is_mutual_contact"] is not None else "N/A")
+        kv("Deleted", data["is_deleted"] if data["is_deleted"] is not None else "N/A")
+        kv("Restricted", "Yes" if data["is_restricted"] else "No")
+        kv("Scam", "Yes" if data["is_scam"] else "No", RED if data["is_scam"] else "white")
+        kv("Fake", "Yes" if data["is_fake"] else "No", RED if data["is_fake"] else "white")
+        kv("Has Photo", "Yes" if data["photo"] else "No")
     return data
 
 
-async def read_profile_photos(client: Client, user: User, limit=20, download=False) -> list:
-    section("Profile Photos", "📸")
+async def read_profile_photos(client: Client, user: User, limit=10,
+                              download=False, quiet=False) -> list:
+    section("Profile Photos", "📸", quiet=quiet)
     photos = []
     try:
         async for photo in client.get_chat_photos(user.id, limit=limit):
             entry = {"date": str(photo.date), "file_id": photo.file_id,
                      "dc_id": photo.dc_id, "local_path": None}
-            kv("Photo", f"{photo.date} | dc={photo.dc_id} | {photo.file_id[:22]}...")
+            if not quiet:
+                kv("Photo", f"{photo.date} | dc={photo.dc_id} | {photo.file_id[:22]}...")
             if download:
                 try:
                     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -756,14 +835,17 @@ async def read_profile_photos(client: Client, user: User, limit=20, download=Fal
                     path = await client.download_media(photo.file_id, file_name=str(MEDIA_DIR / fname))
                     if path:
                         entry["local_path"] = str(path)
-                        success(f"↓ {path}")
+                        if not quiet:
+                            success(f"↓ {path}")
                 except Exception as e:
-                    warn(f"Gagal download: {e}")
+                    if not quiet:
+                        warn(f"Gagal download: {e}")
             photos.append(entry)
-        if not photos:
+        if not photos and not quiet:
             warn("Tidak ada foto profil publik.")
     except Exception as e:
-        error(f"Gagal ambil foto: {e}")
+        if not quiet:
+            error(f"Gagal ambil foto: {e}")
     return photos
 
 
@@ -783,7 +865,8 @@ COUNTRY_HINTS = {
 
 
 def geo_from_bio(bio: str) -> dict:
-    result = {"coordinates": None, "maps_link": None, "country": None, "city": None, "hits": []}
+    result = {"coordinates": None, "maps_link": None, "country": None,
+              "city": None, "hits": []}
     if not bio:
         return result
     bio_l = bio.lower()
@@ -796,7 +879,9 @@ def geo_from_bio(bio: str) -> dict:
                 result["maps_link"] = f"https://maps.google.com/?q={lat},{lon}"
         except ValueError:
             pass
-    mm = re.search(r"(https?://(?:www\.)?(?:maps\.google\.com|goo\.gl/maps|maps\.app\.goo\.gl|yandex\.com/maps)[^\s]*)", bio)
+    mm = re.search(
+        r"(https?://(?:www\.)?(?:maps\.google\.com|goo\.gl/maps|maps\.app\.goo\.gl|yandex\.com/maps)[^\s]*)",
+        bio)
     if mm:
         result["maps_link"] = mm.group(1)
     for hint, country in COUNTRY_HINTS.items():
@@ -809,25 +894,26 @@ def geo_from_bio(bio: str) -> dict:
     return result
 
 
-def show_geo(geo: dict):
-    section("Geolocation", "🌍")
+def show_geo(geo: dict, quiet=False):
+    section("Geolocation", "🌍", quiet=quiet)
     if not any([geo["coordinates"], geo["maps_link"], geo["country"], geo["city"]]):
-        warn("Tidak ada info lokasi.")
+        if not quiet:
+            warn("Tidak ada info lokasi.")
         return
     if geo["coordinates"]:
-        kv("Coordinates", f"{geo['coordinates']['lat']}, {geo['coordinates']['lon']}", RED)
+        kv("Coordinates", f"{geo['coordinates']['lat']}, {geo['coordinates']['lon']}", RED, quiet)
     if geo["maps_link"]:
-        kv("Maps Link", geo["maps_link"], "cyan")
+        kv("Maps Link", geo["maps_link"], "cyan", quiet)
     if geo["country"]:
-        kv("Country", geo["country"], RED)
+        kv("Country", geo["country"], RED, quiet)
     if geo["city"]:
-        kv("City", geo["city"])
+        kv("City", geo["city"], quiet=quiet)
     if geo["hits"]:
-        kv("Hints", ", ".join(geo["hits"]), "yellow")
+        kv("Hints", ", ".join(geo["hits"]), YELLOW, quiet)
 
 
-def track_username(user: User) -> dict:
-    section("Username History", "🔗")
+def track_username(user: User, quiet=False) -> dict:
+    section("Username History", "🔗", quiet=quiet)
     HISTORY_DIR.mkdir(exist_ok=True)
     file = HISTORY_DIR / f"user_{user.id}.json"
     entry = {
@@ -845,16 +931,20 @@ def track_username(user: User) -> dict:
     prev = [h.get("username") for h in history if h.get("username")]
     changed = (not history) or (history[-1].get("username") != user.username)
     history.append(entry)
-    with open(file, "w") as f:
-        json.dump(history, f, indent=2, ensure_ascii=False, default=str)
-    kv("Current", f"@{user.username}" if user.username else "None", RED)
-    kv("Snapshots", len(history))
-    if prev:
-        kv("Previous", ", ".join(f"@{u}" for u in set(prev)))
-    if changed and len(history) > 1:
-        warn("Username BERUBAH!")
-    elif changed:
-        info("Snapshot pertama.")
+    try:
+        with open(file, "w") as f:
+            json.dump(history, f, indent=2, ensure_ascii=False, default=str)
+    except Exception:
+        pass
+    if not quiet:
+        kv("Current", f"@{user.username}" if user.username else "None", RED)
+        kv("Snapshots", len(history))
+        if prev:
+            kv("Previous", ", ".join(f"@{u}" for u in set(prev)))
+        if changed and len(history) > 1:
+            warn("Username BERUBAH!")
+        elif changed:
+            info("Snapshot pertama.")
     return {"current": user.username, "history": history, "changed": changed}
 
 
@@ -865,7 +955,8 @@ def media_label(message) -> str:
     return f"[{mt}]"
 
 
-async def try_download(client: Client, message, user_id: int, max_mb=20) -> str | None:
+async def try_download(client: Client, message, user_id: int,
+                       max_mb=20, quiet=False) -> str | None:
     if not message.media:
         return None
     size_mb = 0
@@ -875,7 +966,8 @@ async def try_download(client: Client, message, user_id: int, max_mb=20) -> str 
             size_mb = (obj.file_size or 0) / (1024 * 1024)
             break
     if size_mb > max_mb:
-        warn(f"Skip media {size_mb:.1f}MB")
+        if not quiet:
+            warn(f"Skip media {size_mb:.1f}MB")
         return None
     try:
         MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -883,29 +975,34 @@ async def try_download(client: Client, message, user_id: int, max_mb=20) -> str 
         path = await client.download_media(message, file_name=str(MEDIA_DIR / fname))
         return str(path) if path else None
     except Exception as e:
-        warn(f"Gagal download: {e}")
+        if not quiet:
+            warn(f"Gagal download: {e}")
         return None
 
 
 async def read_common_groups(client: Client, user: User, msg_limit: int,
                              max_scan: int, download_media: bool,
-                             max_mb: int, quiet: bool) -> list:
-    section("Common Groups & Messages", "🌐")
+                             max_mb: int, quiet=False) -> list:
+    section("Common Groups & Messages", "🌐", quiet=quiet)
     results = []
     try:
         common = await client.get_common_chats(user.id)
     except FloodWait as fw:
-        await asyncio.sleep(fw.value)
+        await asyncio.sleep(fw.value + 1)
         return results
     except Exception as e:
-        error(f"Gagal: {e}")
+        if not quiet:
+            error(f"Gagal: {e}")
         return results
     if not common:
-        warn("Tidak ada grup bersama.")
+        if not quiet:
+            warn("Tidak ada grup bersama.")
         return results
-    info(f"Total grup bersama: {len(common)}")
+    if not quiet:
+        info(f"Total grup bersama: {len(common)}")
+
     for idx, chat in enumerate(common, 1):
-        progress_bar(idx, len(common), prefix=f"Grup {idx}")
+        progress_bar(idx, len(common), prefix=f"Grup {idx}", quiet=quiet)
         chat_data = {
             "chat_id": chat.id, "title": chat.title,
             "type": str(chat.type).split(".")[-1] if chat.type else None,
@@ -914,6 +1011,11 @@ async def read_common_groups(client: Client, user: User, msg_limit: int,
             "description": (getattr(chat, "description", None) or "")[:150],
             "dc_id": getattr(chat, "dc_id", None),
         }
+        if not quiet:
+            print()
+            kv("Group", chat_data["title"], RED)
+            kv("Members", chat_data["members"] or "N/A")
+
         messages, count, scanned = [], 0, 0
         try:
             async for message in client.get_chat_history(chat.id, limit=max_scan):
@@ -925,17 +1027,20 @@ async def read_common_groups(client: Client, user: User, msg_limit: int,
                              "date": ts, "text": text, "message_id": message.id,
                              "media_path": None}
                     if download_media and message.media:
-                        entry["media_path"] = await try_download(client, message, user.id, max_mb)
+                        entry["media_path"] = await try_download(
+                            client, message, user.id, max_mb, quiet)
                     messages.append(entry)
                     count += 1
                     if msg_limit > 0 and count >= msg_limit:
                         break
         except FloodWait as fw:
-            await asyncio.sleep(fw.value)
+            await asyncio.sleep(fw.value + 1)
         except (ChatAdminRequired, UserNotParticipant, ChannelPrivate, ChatForbidden):
-            warn(f"Tidak ada akses {chat_data['title']}")
+            if not quiet:
+                warn(f"Tidak ada akses {chat_data['title']}")
         except Exception as e:
-            error(f"Error di {chat_data['title']}: {e}")
+            if not quiet:
+                error(f"Error di {chat_data['title']}: {e}")
         results.append({"chat": chat_data, "messages": messages,
                         "scanned": scanned, "found": count})
     return results
@@ -943,8 +1048,8 @@ async def read_common_groups(client: Client, user: User, msg_limit: int,
 
 async def read_private_chat(client: Client, user: User, msg_limit: int,
                             max_scan: int, download_media: bool,
-                            max_mb: int, quiet: bool) -> list:
-    section("Private Chat History", "💬")
+                            max_mb: int, quiet=False) -> list:
+    section("Private Chat History", "💬", quiet=quiet)
     messages = []
     try:
         count = 0
@@ -955,25 +1060,30 @@ async def read_private_chat(client: Client, user: User, msg_limit: int,
             entry = {"date": ts, "sender": sender, "text": text,
                      "message_id": m.id, "media_path": None}
             if download_media and m.media:
-                entry["media_path"] = await try_download(client, m, user.id, max_mb)
+                entry["media_path"] = await try_download(
+                    client, m, user.id, max_mb, quiet)
             messages.append(entry)
             count += 1
             if msg_limit > 0 and count >= msg_limit:
                 break
         if count == 0:
-            warn("Tidak ada private chat.")
+            if not quiet:
+                warn("Tidak ada private chat.")
         else:
-            info(f"→ {count} pesan.")
+            if not quiet:
+                info(f"→ {count} pesan.")
     except Exception as e:
-        warn(f"Error: {e}")
+        if not quiet:
+            warn(f"Error: {e}")
     return messages
 
 
 async def analyze_mentions(client: Client, user: User, groups: list,
-                           limit_per_chat=1000) -> dict:
-    section("Mention Analysis", "🎯")
+                           limit_per_chat=1000, quiet=False) -> dict:
+    section("Mention Analysis", "🎯", quiet=quiet)
     if not groups:
-        warn("Tidak ada grup.")
+        if not quiet:
+            warn("Tidak ada grup.")
         return {}
     mentioned_by, mentioned_users, replied_to = Counter(), Counter(), Counter()
     total = 0
@@ -1003,27 +1113,31 @@ async def analyze_mentions(client: Client, user: User, groups: list,
                 if m.from_user and m.from_user.id == tid and text:
                     for mm in re.findall(r"@(\w{3,32})", text):
                         mentioned_users["@" + mm] += 1
+        except FloodWait as fw:
+            await asyncio.sleep(fw.value + 1)
         except Exception:
             pass
-    print(colored(f"\n   Pesan dianalisis: {total}", BRIGHT_RED, attrs=["bold"]))
-    if mentioned_by:
-        print(colored("\n   ▸ Top mention target:", BRIGHT_RED, attrs=["bold"]))
-        for k, c in mentioned_by.most_common(10):
-            kv(k, c, RED)
-    if mentioned_users:
-        print(colored("\n   ▸ Top di-mention target:", BRIGHT_RED, attrs=["bold"]))
-        for k, c in mentioned_users.most_common(10):
-            kv(k, c, RED)
+    if not quiet:
+        print(colored(f"\n   Pesan dianalisis: {total}", BRIGHT_RED, attrs=["bold"]))
+        if mentioned_by:
+            print(colored("\n   ▸ Top mention target:", BRIGHT_RED, attrs=["bold"]))
+            for k, c in mentioned_by.most_common(10):
+                kv(k, c, RED)
+        if mentioned_users:
+            print(colored("\n   ▸ Top di-mention target:", BRIGHT_RED, attrs=["bold"]))
+            for k, c in mentioned_users.most_common(10):
+                kv(k, c, RED)
     return {"total_analyzed": total,
             "mentioned_by": mentioned_by.most_common(20),
             "mentioned_users": mentioned_users.most_common(20),
             "replied_to": replied_to.most_common(20)}
 
 
-def analyze_activity(all_msgs: list) -> dict:
-    section("Activity Analysis", "📊")
+def analyze_activity(all_msgs: list, quiet=False) -> dict:
+    section("Activity Analysis", "📊", quiet=quiet)
     if not all_msgs:
-        warn("Tidak ada data.")
+        if not quiet:
+            warn("Tidak ada data.")
         return {}
     hours = [0] * 24
     weekdays = [0] * 7
@@ -1037,65 +1151,78 @@ def analyze_activity(all_msgs: list) -> dict:
     peak_h = hours.index(max(hours))
     peak_d = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"][weekdays.index(max(weekdays))]
     est_tz = peak_h - 12
-    print(colored("\n   Jam aktif:", BRIGHT_RED, attrs=["bold"]))
-    for h in range(24):
-        bar = "█" * int(hours[h] / max(1, max(hours)) * 20)
-        print(colored(f"    {h:02d}:00 │{bar:<20}│ {hours[h]}", RED))
-    print(colored("\n   Hari aktif:", BRIGHT_RED, attrs=["bold"]))
-    for i, d in enumerate(["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]):
-        bar = "█" * int(weekdays[i] / max(1, max(weekdays)) * 20)
-        print(colored(f"    {d} │{bar:<20}│ {weekdays[i]}", RED))
-    kv("Peak Hour", f"{peak_h:02d}:00", RED)
-    kv("Peak Day", peak_d, RED)
-    kv("Est. TZ", f"UTC{est_tz:+d}", "yellow")
+    if not quiet:
+        print(colored("\n   Jam aktif:", BRIGHT_RED, attrs=["bold"]))
+        for h in range(24):
+            bar = "█" * int(hours[h] / max(1, max(hours)) * 20)
+            print(colored(f"    {h:02d}:00 │{bar:<20}│ {hours[h]}", RED))
+        print(colored("\n   Hari aktif:", BRIGHT_RED, attrs=["bold"]))
+        for i, d in enumerate(["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]):
+            bar = "█" * int(weekdays[i] / max(1, max(weekdays)) * 20)
+            print(colored(f"    {d} │{bar:<20}│ {weekdays[i]}", RED))
+        kv("Peak Hour", f"{peak_h:02d}:00", RED)
+        kv("Peak Day", peak_d, RED)
+        kv("Est. TZ", f"UTC{est_tz:+d}", YELLOW)
     return {"hourly": hours, "weekday": weekdays,
             "peak_hour": peak_h, "peak_day": peak_d, "est_tz": est_tz}
 
 
-async def read_saved(client: Client, limit=100) -> list:
-    section("Saved Messages", "📥")
+async def read_saved(client: Client, limit=100, quiet=False) -> list:
+    section("Saved Messages", "📥", quiet=quiet)
     msgs = []
     try:
         async for m in client.get_chat_history("me", limit=limit):
             text = m.text or media_label(m) or "[empty]"
             msgs.append({"date": m.date.strftime("%Y-%m-%d %H:%M:%S"),
                          "text": text, "message_id": m.id})
-        if not msgs:
+        if not msgs and not quiet:
             warn("Kosong.")
     except Exception as e:
-        error(f"Gagal: {e}")
+        if not quiet:
+            error(f"Gagal: {e}")
     return msgs
 
 
-async def read_contacts(client: Client, limit=500) -> list:
-    section("Contacts", "📇")
+async def read_contacts(client: Client, limit=500, quiet=False) -> list:
+    section("Contacts", "📇", quiet=quiet)
     contacts = []
     try:
         async for c in client.get_contacts(limit=limit):
             contacts.append({"id": c.id, "username": c.username,
                              "first_name": c.first_name, "last_name": c.last_name,
                              "phone": c.phone_number})
-        info(f"Total: {len(contacts)}")
+        if not quiet:
+            info(f"Total: {len(contacts)}")
     except Exception as e:
-        error(f"Gagal: {e}")
+        if not quiet:
+            error(f"Gagal: {e}")
     return contacts
 
 
+# ══════════════════════════════════════════════════════════════════
+# EXPORTS
+# ══════════════════════════════════════════════════════════════════
 def _safe(s: str) -> str:
     return "".join(c if c.isalnum() else "_" for c in s)
 
 
-def export_json(payload: dict, target: str) -> str:
+def export_json(payload: dict, target: str, quiet=False) -> str:
     REPORT_DIR.mkdir(exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = REPORT_DIR / f"{_safe(target)}_{ts}.json"
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
-    success(f"JSON → {path}")
-    return str(path)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+        if not quiet:
+            success(f"JSON → {path}")
+        return str(path)
+    except Exception as e:
+        if not quiet:
+            error(f"JSON export error: {e}")
+        return ""
 
 
-def export_csv(payload: dict, target: str) -> str:
+def export_csv(payload: dict, target: str, quiet=False) -> str:
     REPORT_DIR.mkdir(exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = REPORT_DIR / f"{_safe(target)}_{ts}.csv"
@@ -1109,21 +1236,26 @@ def export_csv(payload: dict, target: str) -> str:
         rows.append({"source": "PRIVATE", "sender": m.get("sender", "TARGET"),
                      "date": m["date"], "message_id": m["message_id"],
                      "text": m["text"], "media": m.get("media_path") or ""})
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["source","sender","date","message_id","text","media"])
-        w.writeheader()
-        w.writerows(rows)
-    success(f"CSV → {path}")
-    return str(path)
+    try:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["source","sender","date","message_id","text","media"])
+            w.writeheader()
+            w.writerows(rows)
+        if not quiet:
+            success(f"CSV → {path}")
+        return str(path)
+    except Exception as e:
+        if not quiet:
+            error(f"CSV export error: {e}")
+        return ""
 
 
-def export_html(payload: dict, target: str) -> str:
+def export_html(payload: dict, target: str, quiet=False) -> str:
     REPORT_DIR.mkdir(exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = REPORT_DIR / f"{_safe(target)}_{ts}.html"
     u = payload.get("user", {})
     geo = payload.get("geo", {})
-    act = payload.get("activity", {})
     s = payload.get("summary", {})
     html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>Red Phantom — {target}</title>
@@ -1159,10 +1291,16 @@ h1{{color:#ff2222;}}h2{{color:#ff4444;border-bottom:1px solid #ff2222;}}
         for m in g.get("messages", [])[:300]:
             html += f"<div class='msg'><span style='color:#ff2222'>[{m['date']}]</span> {m['text'][:250]}</div>"
     html += "</body></html>"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
-    success(f"HTML → {path}")
-    return str(path)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        if not quiet:
+            success(f"HTML → {path}")
+        return str(path)
+    except Exception as e:
+        if not quiet:
+            error(f"HTML export error: {e}")
+        return ""
 
 
 def snap_user(u: User) -> dict:
@@ -1176,10 +1314,9 @@ def snap_user(u: User) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════
-# MAIN ORCHESTRATOR (MANUAL)
+# MANUAL RUN
 # ══════════════════════════════════════════════════════════════════
 async def run_manual(userbot: Client, notifier: BotNotifier):
-    """Mode manual: input target + menu + scan + kirim ke bot."""
     user = await resolve_target(userbot)
     if not user:
         return
@@ -1190,18 +1327,18 @@ async def run_manual(userbot: Client, notifier: BotNotifier):
         return
 
     section("Parameter Scrape", "⚙")
-    msg_limit = ask_int("Limit pesan per chat (0=unlimited)", default=100, min_val=0)
-    max_scan  = ask_int("Max pesan scan per chat", default=5000, min_val=1)
+    msg_limit = ask_int("Limit pesan per chat (0=unlimited)",
+                        default=BOT_CONFIG["default_msg_limit"], min_val=0)
+    max_scan  = ask_int("Max pesan scan per chat",
+                        default=BOT_CONFIG["default_max_scan"], min_val=1)
     download  = ask_yes_no("Download media?", "n")
-    max_mb    = ask_int("Max media MB", default=20, min_val=1) if download else 20
+    max_mb    = ask_int("Max media MB", default=BOT_CONFIG["default_max_mb"], min_val=1) if download else 20
 
     if opts.get("monitor"):
-        # Monitor mode
         interval = ask_int("Monitor interval detik", default=60, min_val=10)
         await notifier.send_text(
             f"🔴 **Monitor started** untuk `@{user.username or user.id}`\n"
-            f"Interval: `{interval}s`\n"
-            f"Notif real-time dikirim ke sini."
+            f"Interval: `{interval}s`"
         )
         state = load_bot_state()
         state.setdefault("monitors", {})[str(user.id)] = {
@@ -1212,9 +1349,10 @@ async def run_manual(userbot: Client, notifier: BotNotifier):
         await monitor_with_bot(userbot, user, notifier, interval=interval)
         return
 
-    # Scan lengkap
+    # Scan penuh
     await scan_and_export(userbot, user, msg_limit, notifier=notifier,
-                          max_scan=max_scan, download=download, max_mb=max_mb)
+                          max_scan=max_scan, download=download, max_mb=max_mb,
+                          quiet=False)
 
     cprint("\n  ══ SELESAI ══", RED, attrs=["bold"])
     cprint("  Red Phantom · Stay sharp, stay red.\n", BRIGHT_RED)
@@ -1226,49 +1364,53 @@ async def run_manual(userbot: Client, notifier: BotNotifier):
 async def main():
     banner()
 
-    # Cek konfigurasi bot
     if BOT_CONFIG["bot_token"] == "1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ":
-        error("GANTI BOT_CONFIG['bot_token'] dulu dengan token dari @BotFather!")
-        error("GANTI BOT_CONFIG['admin_ids'] dengan ID Anda dari @userinfobot!")
+        error("GANTI BOT_CONFIG['bot_token'] dulu!")
         sys.exit(1)
     if not BOT_CONFIG["admin_ids"] or BOT_CONFIG["admin_ids"][0] == 123456789:
-        error("GANTI BOT_CONFIG['admin_ids'] dengan ID Telegram Anda!")
+        error("GANTI BOT_CONFIG['admin_ids'] dulu!")
         sys.exit(1)
 
     config = get_config()
 
-    # Userbot (akun Anda)
     userbot = Client(
         config["session_name"],
         api_id=int(config["api_id"]),
         api_hash=config["api_hash"],
     )
-
-    # Bot
     bot = Client(
         "red_phantom_bot",
         api_id=int(config["api_id"]),
         api_hash=config["api_hash"],
         bot_token=BOT_CONFIG["bot_token"],
     )
-
     notifier = BotNotifier(bot, BOT_CONFIG["admin_ids"])
 
-    # Start both
-    await userbot.start()
-    await bot.start()
+    try:
+        await userbot.start()
+        success("Userbot online")
+        await bot.start()
+        success("Bot online")
+    except AuthKeyUnregistered:
+        error("Session invalid. Hapus *.session, jalankan ulang, login OTP.")
+        sys.exit(1)
+    except Exception as e:
+        error(f"Start error: {e}")
+        traceback.print_exc()
+        sys.exit(1)
 
-    me_bot = await bot.get_me()
-    me_user = await userbot.get_me()
-    success(f"Bot online: @{me_bot.username}")
-    success(f"Userbot online: @{me_user.username or me_user.id}")
-    info(f"Admin ID: {BOT_CONFIG['admin_ids']}")
+    try:
+        me_bot = await bot.get_me()
+        me_user = await userbot.get_me()
+        success(f"Bot: @{me_bot.username}")
+        success(f"Userbot: @{me_user.username or me_user.id}")
+        info(f"Admin ID: {BOT_CONFIG['admin_ids']}")
+    except Exception as e:
+        warn(f"Get me error: {e}")
 
-    # Register bot handlers
     register_bot_handlers(bot, userbot, notifier)
 
-    # Kirim welcome ke admin
-    if BOT_CONFIG.get("notify_realtime", True):
+    try:
         await notifier.send_text(
             f"🩸 **RED PHANTOM ONLINE**\n\n"
             f"Bot: `@{me_bot.username}`\n"
@@ -1276,23 +1418,27 @@ async def main():
             f"Time: `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}`\n\n"
             f"Ketik `/help` untuk commands."
         )
+    except Exception as e:
+        warn(f"Welcome send error: {e}")
 
-    # Menu interaktif CLI + Bot bersamaan
     try:
         while True:
             section("Menu Utama", "◆")
             print(colored("    1. Scan target (manual input)", BRIGHT_RED))
             print(colored("    2. Monitor target", BRIGHT_RED))
             print(colored("    3. Keluar", BRIGHT_RED))
-            print(colored("\n    💡 Bot commands aktif — bisa juga kirim /scan via bot", "cyan"))
+            print(colored("\n    💡 Bot aktif — bisa juga ketik /scan di bot", "cyan"))
 
             choice = ask("Pilihan (1-3)", default="1")
             if choice == "3":
                 break
             elif choice == "1":
-                await run_manual(userbot, notifier)
+                try:
+                    await run_manual(userbot, notifier)
+                except Exception as e:
+                    error(f"Scan error: {e}")
+                    traceback.print_exc()
             elif choice == "2":
-                # Monitor
                 user = await resolve_target(userbot)
                 if user:
                     interval = ask_int("Interval detik", default=60, min_val=10)
@@ -1303,14 +1449,32 @@ async def main():
                     }
                     save_bot_state(state)
                     await notifier.send_text(f"🔴 Monitor started `@{user.username or user.id}`")
-                    await monitor_with_bot(userbot, user, notifier, interval=interval)
+                    try:
+                        await monitor_with_bot(userbot, user, notifier, interval=interval)
+                    except KeyboardInterrupt:
+                        info("Monitor stopped.")
+                        state = load_bot_state()
+                        state.get("monitors", {}).pop(str(user.id), None)
+                        save_bot_state(state)
+            else:
+                warn("Pilihan tidak valid.")
 
     except KeyboardInterrupt:
-        cprint("\n  [!] Dibatalkan.", "yellow")
+        cprint("\n  [!] Dibatalkan.", YELLOW)
 
-    await notifier.send_text("⏹ **RED PHANTOM OFFLINE**")
-    await bot.stop()
-    await userbot.stop()
+    # Cleanup
+    try:
+        await notifier.send_text("⏹ **RED PHANTOM OFFLINE**")
+    except Exception:
+        pass
+    try:
+        await bot.stop()
+    except Exception:
+        pass
+    try:
+        await userbot.stop()
+    except Exception:
+        pass
     cprint("\n  ══ BYE ══\n", RED, attrs=["bold"])
 
 
@@ -1320,11 +1484,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         cprint("\n\n  [!] Dibatalkan user.\n", RED, attrs=["bold"])
         sys.exit(0)
-    except AuthKeyUnregistered:
-        cprint("\n  [FATAL] Session invalid — hapus *.session, login ulang.\n", RED)
-        sys.exit(1)
     except Exception as e:
-        import traceback
         traceback.print_exc()
         cprint(f"\n  [FATAL] {e}\n", RED, attrs=["bold"])
         sys.exit(1)
